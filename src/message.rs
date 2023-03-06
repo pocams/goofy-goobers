@@ -16,11 +16,31 @@ pub struct Body<B: Debug> {
     message: B
 }
 
+impl<B: Clone + Debug> Clone for Body<B> {
+    fn clone(&self) -> Self {
+        Body {
+            msg_id: self.msg_id.clone(),
+            in_reply_to: self.in_reply_to.clone(),
+            message: self.message.clone(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Envelope<B: Debug> {
     pub src: String,
     pub dest: String,
     body: Body<B>
+}
+
+impl<B: Clone + Debug> Clone for Envelope<B> {
+    fn clone(&self) -> Self {
+        Envelope {
+            src: self.src.clone(),
+            dest: self.dest.clone(),
+            body: self.body.clone(),
+        }
+    }
 }
 
 impl<B: Debug> Envelope<B> {
