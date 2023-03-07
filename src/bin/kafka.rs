@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::{BufRead, Write};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::{panic, process, thread};
-use std::thread::JoinHandle;
+use std::cmp::Ordering;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use goofy_goobers::error::{Error, ErrorCode};
+use goofy_goobers::error::ErrorCode;
 use goofy_goobers::message::Envelope;
 
 const KV_ADDRESS: &str = "seq-kv";
@@ -40,18 +39,42 @@ enum Message {
 
     // Workload messages
     Send { key: String, msg: u64 },
-    SendOk { offset: u64 },
-    Poll { offsets: HashMap<String, u64> },
-    PollOk { msgs: HashMap<String, Vec<(u64, u64)>> },
-    CommitOffsets { offsets: HashMap<String, u64> },
+    SendOk { offset: usize },
+    Poll { offsets: HashMap<String, usize> },
+    PollOk { msgs: HashMap<String, Vec<(usize, u64)>> },
+    CommitOffsets { offsets: HashMap<String, usize> },
     CommitOffsetsOk,
     ListCommittedOffsets { keys: Vec<String> },
-    ListCommittedOffsetsOk { offsets: HashMap<String, u64> },
+    ListCommittedOffsetsOk { offsets: HashMap<String, usize> },
+
+    // Node to node messages
+    Transactions { transactions: Vec<Transaction>},
+    PollTransactions { first_xid: usize },
 
     Error {
         code: u64,
         text: String
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+struct Transaction {
+    node: String,
+    transaction_id: usize,
+    key: String,
+    message: u64,
+}
+
+impl PartialOrd<Self> for Transaction {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.transaction_id.partial_cmp(&other.transaction_id)
+    }
+}
+
+impl Ord for Transaction {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap()
+    }
 }
 
 struct InputHandler;
@@ -236,17 +259,18 @@ fn main() {
         process::exit(1);
     }));
 
-
     let output_sender = OutputHandler::start::<Message>();
     let (main_sender, main_receiver) = channel();
     let input_handler: InputHandlerHandle<Message> = InputHandler::start::<Message>(vec![main_sender]);
     let mut local_node = Default::default();
+    let mut other_nodes = Vec::new();
 
     for envelope in main_receiver.iter() {
         match envelope.message() {
             Message::Init { node_id, node_ids } => {
                 eprintln!("init: {:?}", envelope);
                 local_node = node_id.clone();
+                other_nodes.extend(node_ids.into_iter().filter(|n| **n != local_node).cloned());
                 output_sender.send(envelope.reply(Message::InitOk)).unwrap();
                 break;
             }
@@ -258,12 +282,9 @@ fn main() {
         }
     }
 
-    let mut xid = XidAssigner::start(local_node, input_handler.new_receiver(), output_sender.clone());
+    let mut xid_assigner = XidAssigner::start(local_node.clone(), input_handler.new_receiver(), output_sender.clone());
 
-    eprintln!("x1 {:?}", xid.get_xid());
-    eprintln!("x2 {:?}", xid.get_xid());
-    eprintln!("x3 {:?}", xid.get_xid());
-    eprintln!("x4 {:?}", xid.get_xid());
+    let mut transaction_log: Vec<Transaction> = Vec::new();
 
     for envelope in main_receiver.iter() {
         if envelope.src == KV_ADDRESS { continue }
@@ -272,10 +293,86 @@ fn main() {
                 eprintln!("topology: {:?}", envelope);
                 output_sender.send(envelope.reply(Message::TopologyOk)).unwrap();
             },
-            Message::Send { key, msg } => {}
-            Message::Poll { offsets } => {}
-            Message::CommitOffsets { offsets } => {}
-            Message::ListCommittedOffsets { keys } => {}
+
+            Message::Send { key, msg } => {
+                let xid = xid_assigner.get_xid();
+                let transaction = Transaction {
+                    node: local_node.clone(),
+                    transaction_id: xid,
+                    key: key.to_string(),
+                    message: *msg,
+                };
+                transaction_log.push(transaction.clone());
+
+                // eprintln!("outgoing txn: {transaction:?}");
+                for other_node in &other_nodes {
+                    output_sender.send(Envelope::new(local_node.clone(), (*other_node).clone(), None, Message::Transactions { transactions: vec![transaction.clone()] })).unwrap();
+                }
+
+                output_sender.send(envelope.reply(Message::SendOk { offset: xid })).unwrap();
+            }
+
+            Message::Poll { offsets } => {
+                let mut reply: HashMap<String, Vec<(usize, u64)>> = HashMap::new();
+                for transaction in &transaction_log {
+                    if offsets.contains_key(&transaction.key) && transaction.transaction_id >= *offsets.get(&transaction.key).unwrap() {
+                        reply.entry(transaction.key.clone()).or_default().push((transaction.transaction_id, transaction.message));
+                    }
+                }
+                output_sender.send(envelope.reply(Message::PollOk { msgs: reply })).unwrap();
+            }
+
+            Message::CommitOffsets { offsets } => {
+                let mut transactions = vec![];
+                for (key, offset) in offsets {
+                    let xid = xid_assigner.get_xid();
+                    let txn = Transaction {
+                        node: local_node.clone(),
+                        transaction_id: xid,
+                        key: format!("offsets:{key}"),
+                        message: *offset as u64,
+                    };
+                    transaction_log.push(txn.clone());
+                    transactions.push(txn);
+                }
+
+                // eprintln!("outgoing txns: {transactions:?}");
+                for other_node in &other_nodes {
+                    output_sender.send(Envelope::new(local_node.clone(), (*other_node).clone(), None, Message::Transactions { transactions: transactions.clone() })).unwrap();
+                }
+
+                output_sender.send(envelope.reply(Message::CommitOffsetsOk)).unwrap();
+            }
+
+            Message::ListCommittedOffsets { keys } => {
+                // FIXME: optimize
+                let mut offsets: HashMap<String, usize> = Default::default();
+                for transaction in &transaction_log {
+                    for query_key in keys {
+                        if transaction.key == format!("offsets:{query_key}") {
+                            offsets.insert(query_key.to_string(), transaction.message as usize);
+                        }
+                    }
+                }
+                output_sender.send(envelope.reply(Message::ListCommittedOffsetsOk { offsets })).unwrap();
+            }
+
+            Message::Transactions { transactions } => {
+                // FIXME: optimize
+                // eprintln!("incoming txns: {transactions:?}");
+                for new_txn in transactions {
+                    if !transaction_log.iter().any(|committed_txn| committed_txn.transaction_id == new_txn.transaction_id) {
+                        transaction_log.push(new_txn.clone());
+                    }
+                }
+                transaction_log.sort_unstable();
+            }
+
+            Message::PollTransactions { first_xid } => {
+                let transactions = transaction_log.iter().filter(|txn| txn.transaction_id >= *first_xid && txn.node == local_node).cloned().collect();
+                output_sender.send(envelope.reply(Message::Transactions { transactions })).unwrap();
+            }
+
             _ => panic!("Unexpected message at runtime: {envelope:?}")
         }
     }
