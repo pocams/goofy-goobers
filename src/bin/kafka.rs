@@ -285,6 +285,7 @@ fn main() {
     let mut xid_assigner = XidAssigner::start(local_node.clone(), input_handler.new_receiver(), output_sender.clone());
 
     let mut transaction_log: Vec<Transaction> = Vec::new();
+    let mut poll_replies = Vec::new();
 
     for envelope in main_receiver.iter() {
         if envelope.src == KV_ADDRESS { continue }
@@ -313,13 +314,7 @@ fn main() {
             }
 
             Message::Poll { offsets } => {
-                let mut reply: HashMap<String, Vec<(usize, u64)>> = HashMap::new();
-                for transaction in &transaction_log {
-                    if offsets.contains_key(&transaction.key) && transaction.transaction_id >= *offsets.get(&transaction.key).unwrap() {
-                        reply.entry(transaction.key.clone()).or_default().push((transaction.transaction_id, transaction.message));
-                    }
-                }
-                output_sender.send(envelope.reply(Message::PollOk { msgs: reply })).unwrap();
+                poll_replies.push((transaction_log.last().map(|t| t.transaction_id).unwrap_or(0), envelope));
             }
 
             Message::CommitOffsets { offsets } => {
@@ -374,6 +369,24 @@ fn main() {
             }
 
             _ => panic!("Unexpected message at runtime: {envelope:?}")
+        }
+
+        if !poll_replies.is_empty() {
+            let last_good_txn = transaction_log.windows(2).find(|ts| ts[1].transaction_id - ts[0].transaction_id > 1).map(|t| t[0].transaction_id) .unwrap_or(usize::MAX);
+            while let Some(idx) = poll_replies.iter().position(|(t, pr)| *t <= last_good_txn) {
+                let (_, env) = poll_replies.remove(idx);
+                let Message::Poll { offsets } = env.message() else {
+                    panic!("Unexpected message in poll_replies: {:?}", env);
+                };
+
+                let mut reply: HashMap<String, Vec<(usize, u64)>> = HashMap::new();
+                for transaction in &transaction_log {
+                    if offsets.contains_key(&transaction.key) && transaction.transaction_id >= *offsets.get(&transaction.key).unwrap() {
+                        reply.entry(transaction.key.clone()).or_default().push((transaction.transaction_id, transaction.message));
+                    }
+                }
+                output_sender.send(env.reply(Message::PollOk { msgs: reply })).unwrap();
+            }
         }
     }
 }
