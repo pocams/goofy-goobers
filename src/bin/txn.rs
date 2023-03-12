@@ -14,9 +14,6 @@ use serde::ser::SerializeSeq;
 use goofy_goobers::error::ErrorCode;
 use goofy_goobers::message::Envelope;
 
-const KV_ADDRESS: &str = "seq-kv";
-const XID_KEY: &str = "xid";
-
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 #[serde(try_from="char", into="char")]
 enum OpType {
